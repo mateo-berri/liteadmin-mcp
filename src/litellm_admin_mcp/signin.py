@@ -34,9 +34,10 @@ REFRESH_MARGIN_SECONDS = 360
 CLIENT_NAME = "litellm-admin-mcp"
 RECORD_FIELDS = ("access_token", "refresh_token", "client_id", "token_endpoint", "revocation_endpoint", "resource")
 OPEN_BROWSER = "import sys, webbrowser; sys.exit(not webbrowser.open(sys.argv[1]))"
-REJECTED_GRANTS = ("invalid_grant", "invalid_client", "unauthorized_client")
+RETRY_LATER = (408, 429)
 ELSEWHERE = (" If that browser runs on another computer, the page it opens after approval will not load. Copy that page's "
-             "full address from the address bar and call sign_in with it as callback_url.")
+             "full address from the address bar right away, since it expires within minutes, and call sign_in with it "
+             "as callback_url.")
 
 
 def default_store_directory() -> Path:
@@ -385,9 +386,8 @@ class BrowserSignIn:
         except ValueError:
             body = None
         if not 200 <= response.status_code < 300 or not isinstance(body, dict):
-            error = body.get("error") if isinstance(body, dict) else None
-            detail = body.get("error_description") or error if isinstance(body, dict) else None
-            rejected = response.status_code == 401 or response.status_code == 400 and error in REJECTED_GRANTS
+            detail = body.get("error_description") or body.get("error") if isinstance(body, dict) else None
+            rejected = 400 <= response.status_code < 500 and response.status_code not in RETRY_LATER
             raise AdminError(f"The gateway's {purpose} failed with HTTP {response.status_code}"
                              + (f": {str(detail)[:200]}" if detail else "") + ".", 401 if rejected else 502)
         return body

@@ -492,7 +492,46 @@ async def test_write_rejected_after_it_ran_is_not_repeated_and_the_next_one_uses
     assert gateway.revocations == []
 
 
-@pytest.mark.parametrize("status, body", [(503, {}), (429, {"error": "slow_down"}), (400, {"error": "invalid_request"})])
+def refusing_renewals(gateway, status, body, handler=None):
+    def handle(request):
+        if request.url.path == "/token" and parse_qs(request.content.decode()).get("grant_type") == ["refresh_token"]:
+            return httpx2.Response(status, json=body)
+        return (handler or gateway.handle)(request)
+    return handle
+
+
+@pytest.mark.parametrize("status, body", [(400, {"error": "invalid_target"}), (400, {"error": "invalid_request"}),
+                                          (404, {"detail": "Not Found"})])
+async def test_expired_sign_in_the_gateway_will_never_renew_is_replaced_by_a_new_sign_in(tmp_path, status, body):
+    gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
+    async with signed_in_session(gateway, store, Browser(gateway)) as session:
+        data(await session.call_tool("list_keys", {}))
+    browser = Browser(gateway)
+    async with signed_in_session(gateway, store, browser, handler=refusing_renewals(gateway, status, body),
+                                 now=lambda: time.time() + 2 * 3600) as session:
+        assert [tool.name for tool in (await session.list_tools()).tools] == ["sign_in"]
+        assert "Signed in to LiteLLM" in (await session.call_tool("sign_in", {})).content[0].text
+        data(await session.call_tool("list_keys", {}))
+    assert len(browser.urls) == 1 and store.load(GATEWAY)["access_token"] == "signed-in-admin-2"
+
+
+async def test_write_rejected_after_it_ran_keeps_the_check_gateway_state_hint_when_renewal_fails(tmp_path):
+    gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
+
+    def rejected_after_writing(request):
+        response = gateway.handle(request)
+        if request.url.path == "/key/generate":
+            gateway.rejected.add("signed-in-admin-1")
+        return response
+
+    handler = refusing_renewals(gateway, 503, {}, rejected_after_writing)
+    async with signed_in_session(gateway, store, Browser(gateway), handler=handler) as session:
+        refused = text(await session.call_tool("create_key", {"body": {"key_alias": "once"}}))
+    assert "token request failed with HTTP 503" in refused and "Check gateway state before repeating" in refused
+    assert len(gateway.writes) == 1 and store.load(GATEWAY)["access_token"] == "signed-in-admin-1"
+
+
+@pytest.mark.parametrize("status, body", [(503, {}), (429, {"error": "slow_down"}), (408, {})])
 async def test_gateway_outage_while_renewing_a_rejected_sign_in_keeps_it(tmp_path, status, body):
     gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
     async with signed_in_session(gateway, store, Browser(gateway)) as session:

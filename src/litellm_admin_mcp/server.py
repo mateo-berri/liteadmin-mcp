@@ -66,7 +66,12 @@ def create_server(gateway: Gateway, *, http: bool = False, sign_in: BrowserSignI
             if sign_in is None or exc.status != 401 and not isinstance(exc, NotAdmin):
                 raise
             failure = exc
-        renewed = await sign_in.renew(key) if renew and not isinstance(failure, NotAdmin) else None
+        try:
+            renewed = await sign_in.renew(key) if renew and not isinstance(failure, NotAdmin) else None
+        except AdminError as exc:
+            if repeat:
+                raise
+            raise AdminError(f"{exc} Check gateway state before repeating this change.", exc.status) from None
         if renewed is not None and repeat:
             return await authenticated(context, renewed, action, renew=False)
         if renewed is not None:
@@ -74,7 +79,8 @@ def create_server(gateway: Gateway, *, http: bool = False, sign_in: BrowserSignI
                              "this change.", failure.status)
         await sign_in.forget(key)
         await announcer(context)()
-        raise AdminError(f"{failure} The saved LiteLLM sign-in was removed; call sign_in to sign in again.", failure.status)
+        raise AdminError(f"{failure} The saved LiteLLM sign-in was removed; call sign_in to sign in again with a "
+                         "proxy-admin account.", failure.status)
 
     async def signed_in(context, callback_url):
         deadline = asyncio.get_running_loop().time() + sign_in.answer_within
