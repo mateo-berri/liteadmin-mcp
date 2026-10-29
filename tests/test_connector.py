@@ -1,5 +1,6 @@
 import copy
 import json
+import pickle
 
 import httpx2
 from mcp.shared.exceptions import MCPError
@@ -8,7 +9,7 @@ import pytest
 from conftest import SPEC, data, session_for
 from litellm_admin_mcp.catalog import OPERATIONS
 from litellm_admin_mcp.config import Config
-from litellm_admin_mcp.gateway import Gateway, HELPERS
+from litellm_admin_mcp.gateway import AdminError, Gateway, HELPERS
 from litellm_admin_mcp.schema import tool_schema
 from litellm_admin_mcp.server import create_http_app
 
@@ -52,6 +53,14 @@ async def test_unverified_user_cannot_discover_or_call(stub):
             await session.list_tools()
         assert (await session.call_tool("create_key", {"body": {"key_alias": "forbidden"}})).is_error
     assert all(r.url.path == "/user/info" for r in stub.requests)
+
+
+async def test_non_admin_rejection_survives_copy_and_pickle(stub):
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(stub.handle)) as client:
+        with pytest.raises(AdminError) as raised:
+            await Gateway(Config("https://gateway.example.com", api_key="viewer"), client).authorize("viewer")
+    for rebuilt in (copy.copy(raised.value), pickle.loads(pickle.dumps(raised.value))):
+        assert (type(rebuilt), str(rebuilt), rebuilt.status) == (type(raised.value), str(raised.value), 403)
 
 
 @pytest.mark.parametrize("arguments", [{}, {"body": {}}, {"body": {"key_alias": 7}}, {"body": {"key_alias": "a"}, "headers": {"Authorization": "spoof"}}])

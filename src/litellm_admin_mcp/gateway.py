@@ -37,8 +37,8 @@ class AdminError(Exception):
 
 
 class NotAdmin(AdminError):
-    def __init__(self):
-        super().__init__("Only current LiteLLM proxy admins may use these tools.", 403)
+    def __init__(self, message: str = "Only current LiteLLM proxy admins may use these tools."):
+        super().__init__(message, 403)
 
 
 @dataclass(frozen=True)
