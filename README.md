@@ -42,23 +42,28 @@ server to a client that supports local MCP processes:
 }
 ```
 
-When your client starts the connector without a saved sign-in, the connector opens
-your browser on the gateway's sign-in page and lists a single `sign_in` tool. Sign in
-as a proxy admin and approve the request. The connector then tells the client that its
-tools changed, and the gateway's admin tools replace `sign_in`. If the browser window
-did not appear or was closed, ask your agent to sign in to LiteLLM: the `sign_in` tool
-opens the page again, waits up to a minute for approval, and otherwise returns the
-sign-in link to open on the same computer.
+When your client starts the connector without a saved sign-in, the connector lists a
+single `sign_in` tool and opens nothing. When you ask your agent to work with the
+gateway, it calls `sign_in`, which opens your browser on the gateway's sign-in page.
+Sign in as a proxy admin and approve the request. The connector then tells the client
+that its tools changed, and the gateway's admin tools replace `sign_in`. The `sign_in`
+tool waits up to a minute for approval. If the browser window did not appear or you
+need longer, it returns the sign-in link to open on the same computer, which stays
+usable for five minutes.
 
 The connector saves the sign-in under `~/.config/litellm-admin-mcp/sign-ins/`
 (under `$XDG_CONFIG_HOME` when set), one file per gateway, readable only by you, and
-renews it before it expires, so later runs do not ask again. To sign out, run the
-same command with `logout`, for example
+renews it before it expires, so later runs and other sessions do not ask again. To
+sign out, run the same command with `logout`, for example
 `LITELLM_BASE_URL=https://your-gateway.example.com uvx --from git+https://github.com/BerriAI/litellm-admin-mcp.git@main litellm-admin-mcp logout`.
-It revokes the sign-in at the gateway and removes the saved file. A sign-in the
-gateway rejects, or one for a user who is not a proxy admin, is revoked and removed
-the same way, and the next request opens a new browser sign-in. Browser sign-in
-needs LiteLLM v1.99.0 or later on the gateway.
+It revokes the sign-in's refresh token at the gateway, so the sign-in is no longer
+renewed, and removes the saved file. The access token the gateway last issued stays
+valid until it expires, and `logout` prints that time. When the gateway rejects the
+saved access token, the connector renews it once. A sign-in that still fails, or one
+for a user who is not a proxy admin, is revoked and removed the same way, and only
+`sign_in` is listed again. Browser sign-in needs a gateway that publishes
+`/.well-known/litellm-cli-auth` (LiteLLM v1.99.0 or later), and the admin tools also
+need the `admin_mcp_permissions` support described above.
 
 To use an existing key instead, add `"LITELLM_API_KEY": "<your-personal-proxy-admin-key>"`
 to `env`. The connector then never opens a browser. Use your client's secret storage

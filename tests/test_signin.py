@@ -234,6 +234,7 @@ async def test_without_a_browser_only_sign_in_is_listed_and_shows_the_link_until
 
     async with signed_in_session(gateway, store, browser, notices) as session:
         assert [tool.name for tool in (await session.list_tools()).tools] == ["sign_in"]
+        assert gateway.clients == {}
         signing_in = await session.call_tool("sign_in", {})
         assert not signing_in.is_error
         link = sign_in_link(signing_in.content[0].text)
@@ -257,6 +258,7 @@ async def test_sign_in_tool_waits_for_approval_in_the_opened_browser_and_links_a
     async with signed_in_session(gateway, store, browser, link_after=.2,
                                  open_browser=lambda url: opened.append(url) or True) as session:
         assert [tool.name for tool in (await session.list_tools()).tools] == ["sign_in"]
+        assert gateway.clients == {}
         slow = await session.call_tool("sign_in", {})
         assert not slow.is_error and sign_in_link(slow.content[0].text) == opened[0]
         waiting = asyncio.create_task(session.call_tool("sign_in", {}))
@@ -264,6 +266,37 @@ async def test_sign_in_tool_waits_for_approval_in_the_opened_browser_and_links_a
         await browser.visit(opened[0])
         assert "Signed in to LiteLLM as signed-in-admin-1" in (await waiting).content[0].text
     assert len(opened) == 1
+
+
+async def test_admin_tool_call_returns_the_sign_in_link_instead_of_waiting_for_the_whole_sign_in(tmp_path):
+    gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
+    opened = []
+    async with signed_in_session(gateway, store, Browser(gateway), link_after=.2, timeout=30,
+                                 open_browser=lambda url: opened.append(url) or True) as session:
+        async with asyncio.timeout(5):
+            waiting = text(await session.call_tool("list_keys", {}))
+    assert sign_in_link(waiting) == opened[0] and waiting.endswith(", then repeat the request.")
+
+
+async def test_sign_in_finds_a_sign_in_saved_by_another_session_and_lists_the_admin_tools(tmp_path):
+    gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
+    browser = Browser(gateway, opens=False)
+    announced = asyncio.Event()
+
+    async def notices(message):
+        if isinstance(message, types.ToolListChangedNotification):
+            announced.set()
+
+    async with signed_in_session(gateway, store, browser, notices) as session:
+        assert [tool.name for tool in (await session.list_tools()).tools] == ["sign_in"]
+        async with signed_in_session(gateway, store, Browser(gateway)) as other:
+            assert not (await other.call_tool("sign_in", {})).is_error
+        signed_in = await session.call_tool("sign_in", {})
+        assert "Signed in to LiteLLM as signed-in-admin-1" in signed_in.content[0].text
+        async with asyncio.timeout(5):
+            await announced.wait()
+        assert "create_key" in {tool.name for tool in (await session.list_tools()).tools}
+    assert browser.urls == []
 
 
 async def test_request_repeated_right_after_approving_waits_for_the_sign_in_to_finish(tmp_path):
@@ -337,6 +370,20 @@ async def test_unsupported_or_foreign_sign_in_discovery_is_refused_before_anythi
     assert [r.url.path for r in gateway.requests] == ["/.well-known/litellm-cli-auth"]
 
 
+@pytest.mark.parametrize("contract, advice", [
+    ({"registration_endpoint": "http://gateway.example.com/register"},
+     "Set PROXY_BASE_URL on the gateway to https://gateway.example.com."),
+    ({"issuer": "https://gateway.internal.example"},
+     "Set PROXY_BASE_URL on the gateway to https://gateway.example.com, or set LITELLM_BASE_URL to "
+     "https://gateway.internal.example:443 if that is this gateway's own address."),
+])
+async def test_discovery_naming_another_address_says_which_setting_fixes_it(tmp_path, contract, advice):
+    gateway = SignInGateway()
+    gateway.contract = contract
+    async with signed_in_session(gateway, CredentialStore(tmp_path / "sign-ins"), Browser(gateway)) as session:
+        assert text(await session.call_tool("list_keys", {})).endswith(advice)
+
+
 async def test_gateway_without_browser_sign_in_says_to_upgrade_or_set_a_key(tmp_path):
     async def handle(request):
         return httpx2.Response(404, json={"detail": "Not Found"})
@@ -347,19 +394,74 @@ async def test_gateway_without_browser_sign_in_says_to_upgrade_or_set_a_key(tmp_
             assert "set LITELLM_API_KEY" in text(await session.call_tool("list_keys", {}))
 
 
-async def test_saved_sign_in_the_gateway_rejects_is_dropped_and_replaced_by_a_new_one(tmp_path):
+async def test_rejected_access_token_is_renewed_and_the_read_repeated_without_signing_anyone_out(tmp_path):
     gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
     async with signed_in_session(gateway, store, Browser(gateway)) as session:
-        data(await session.call_tool("create_key", {"body": {"key_alias": "first"}}))
+        data(await session.call_tool("list_keys", {}))
     gateway.rejected.add("signed-in-admin-1")
-    browser = Browser(gateway)
+    browser = Browser(gateway, opens=False)
     async with signed_in_session(gateway, store, browser) as session:
-        assert "removed; the next request opens a new browser sign-in" in text(await session.call_tool("list_keys", {}))
-        assert browser.urls == [] and "refresh-1" not in gateway.refresh_tokens
-        data(await session.call_tool("create_key", {"body": {"key_alias": "second"}}))
-    assert len(browser.urls) == 1
+        data(await session.call_tool("list_keys", {}))
+        assert "create_key" in {tool.name for tool in (await session.list_tools()).tools}
+    assert browser.urls == [] and gateway.revocations == []
+    assert store.load(GATEWAY)["access_token"] == "signed-in-admin-2"
+
+
+async def test_write_rejected_after_it_ran_is_not_repeated_and_the_next_one_uses_the_renewed_sign_in(tmp_path):
+    gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
+
+    def rejected_after_writing(request):
+        response = gateway.handle(request)
+        if request.url.path == "/key/generate":
+            gateway.rejected.add("signed-in-admin-1")
+        return response
+
+    async with signed_in_session(gateway, store, Browser(gateway), handler=rejected_after_writing) as session:
+        refused = text(await session.call_tool("create_key", {"body": {"key_alias": "once"}}))
+        assert "sign-in was renewed; check gateway state before repeating" in refused
+        assert len(gateway.writes) == 1
+        data(await session.call_tool("create_key", {"body": {"key_alias": "next"}}))
     assert authorizations(gateway) == ["Bearer signed-in-admin-1", "Bearer signed-in-admin-2"]
-    assert [r["token"] for r in gateway.revocations] == ["refresh-1"]
+    assert gateway.revocations == []
+
+
+async def test_gateway_outage_while_renewing_a_rejected_sign_in_keeps_it(tmp_path):
+    gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
+    async with signed_in_session(gateway, store, Browser(gateway)) as session:
+        data(await session.call_tool("list_keys", {}))
+    gateway.rejected.add("signed-in-admin-1")
+
+    def token_endpoint_down(request):
+        if request.url.path == "/token":
+            return httpx2.Response(503, json={})
+        return gateway.handle(request)
+
+    async with signed_in_session(gateway, store, Browser(gateway, opens=False), handler=token_endpoint_down) as session:
+        assert "token request failed with HTTP 503" in text(await session.call_tool("list_keys", {}))
+    assert store.load(GATEWAY)["access_token"] == "signed-in-admin-1" and gateway.revocations == []
+
+
+async def test_rejected_sign_in_that_cannot_be_renewed_is_revoked_and_only_sign_in_is_listed(tmp_path):
+    gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
+    async with signed_in_session(gateway, store, Browser(gateway)) as session:
+        data(await session.call_tool("list_keys", {}))
+    gateway.rejected.add("signed-in-admin-1")
+    gateway.refresh_tokens.clear()
+    announced = asyncio.Event()
+
+    async def notices(message):
+        if isinstance(message, types.ToolListChangedNotification):
+            announced.set()
+
+    browser = Browser(gateway)
+    async with signed_in_session(gateway, store, browser, notices) as session:
+        assert "sign-in was removed; call sign_in to sign in again" in text(await session.call_tool("list_keys", {}))
+        async with asyncio.timeout(5):
+            await announced.wait()
+        assert [tool.name for tool in (await session.list_tools()).tools] == ["sign_in"]
+        assert browser.urls == [] and [r["token"] for r in gateway.revocations] == ["refresh-1"]
+        assert "Signed in to LiteLLM as signed-in-admin-2" in (await session.call_tool("sign_in", {})).content[0].text
+    assert len(browser.urls) == 1
 
 
 async def test_sign_in_as_a_non_admin_is_revoked_and_removed_so_an_admin_can_sign_in(tmp_path):
@@ -373,6 +475,16 @@ async def test_sign_in_as_a_non_admin_is_revoked_and_removed_so_an_admin_can_sig
         data(await session.call_tool("create_key", {"body": {"key_alias": "admin"}}))
     assert len(browser.urls) == 2
     assert authorizations(gateway) == ["Bearer signed-in-admin-2"]
+
+
+async def test_every_spelling_of_the_gateway_origin_shares_one_sign_in(tmp_path):
+    gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
+    async with signed_in_session(gateway, store, Browser(gateway)) as session:
+        data(await session.call_tool("list_keys", {}))
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(gateway.handle)) as client:
+        sign_in = BrowserSignIn("https://Gateway.Example.com:443", client, store,
+                                open_browser=lambda url: pytest.fail("browser opened"))
+        assert await sign_in.saved() == "signed-in-admin-1"
 
 
 async def test_sign_ins_for_different_gateways_are_kept_apart(tmp_path):
@@ -458,6 +570,7 @@ async def test_current_protocol_client_gets_the_admin_tools_once_a_slow_browser_
             assert client.protocol_version == "2026-07-28"
             async with client.listen(tools_list_changed=True) as changes:
                 assert [tool.name for tool in (await client.list_tools()).tools] == ["sign_in"]
+                signing_in = asyncio.create_task(client.call_tool("sign_in", {}))
                 async with asyncio.timeout(10):
                     while not opened.exists():
                         await asyncio.sleep(.05)
@@ -466,6 +579,7 @@ async def test_current_protocol_client_gets_the_admin_tools_once_a_slow_browser_
                     assert (await person.get(gateway.approve(opened.read_text()))).status_code == 200
                 async with asyncio.timeout(10):
                     await anext(aiter(changes))
+                assert "Signed in to LiteLLM as signed-in-admin-1" in (await signing_in).content[0].text
             assert "create_key" in {tool.name for tool in (await client.list_tools()).tools}
             data(await client.call_tool("create_key", {"body": {"key_alias": "slow"}}))
     assert authorizations(gateway) == ["Bearer signed-in-admin-1"]
@@ -480,12 +594,12 @@ async def logout(url, tmp_path):
 
 
 @pytest.mark.parametrize("revocation_status, exit_code, said, kept", [
-    (200, 0, "The gateway revoked the sign-in", False),
+    (200, 0, "The gateway revoked the sign-in's refresh token", False),
     (503, 1, "could not sign out: The gateway could not record the sign-out right now. Nothing was removed", True),
-    (500, 0, "did not confirm revoking it (HTTP 500)", False),
+    (500, 0, "did not confirm revoking its refresh token (HTTP 500)", False),
 ])
-async def test_logout_revokes_the_saved_sign_in_at_the_gateway_and_removes_it(tmp_path, revocation_status, exit_code,
-                                                                               said, kept):
+async def test_logout_revokes_the_refresh_token_removes_the_sign_in_and_says_how_long_its_access_token_lasts(
+        tmp_path, revocation_status, exit_code, said, kept):
     gateway = SignInGateway()
     async with served(gateway) as url:
         browser = Browser(gateway)
@@ -495,6 +609,7 @@ async def test_logout_revokes_the_saved_sign_in_at_the_gateway_and_removes_it(tm
         gateway.revocation_status = revocation_status
         returncode, output = await logout(url, tmp_path)
         assert (returncode, said in output) == (exit_code, True), output
+        assert ("access token it last issued stays valid at the gateway until" in output) == (not kept), output
         assert saved(tmp_path, url).exists() == kept
         assert ("refresh-1" in gateway.refresh_tokens) == (revocation_status != 200)
         assert [r["client_id"] for r in gateway.revocations] == ["client-1"]

@@ -9,8 +9,8 @@ none is configured, one from the gateway's browser sign-in. That sign-in uses PK
 with a loopback redirect on 127.0.0.1, accepts only the pending request's state,
 and sends nothing to endpoints outside the configured gateway's origin. The
 resulting access and refresh tokens are kept in an owner-only file (mode 0600 in a
-0700 directory) keyed by gateway origin, and are dropped when the gateway rejects
-them. Hosted
+0700 directory) keyed by gateway origin. A sign-in the gateway still rejects after
+one renewal is revoked and removed. Hosted
 HTTP requests require each caller's own bearer credential; the server refuses
 to start HTTP mode with a process-wide gateway key. The gateway's live proxy-admin
 role is checked for discovery, before execution and before returning results.

@@ -3,11 +3,13 @@
 The gateway publishes its native-client contract at /.well-known/litellm-cli-auth (the
 same one `lite login --pkce` uses): register a public client with a loopback redirect,
 send the user's browser to /authorize with PKCE S256, then redeem the code at /token for
-a self-renewing gateway credential issued for the proxy API, revoked at the gateway's revocation
-endpoint when it is signed out or rejected."""
+a self-renewing gateway credential issued for the proxy API. Signing out, or a credential the
+gateway still rejects after renewal, revokes its refresh token at the gateway's revocation endpoint."""
 import asyncio
 import base64
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -21,6 +23,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import httpx2
 
+from .config import gateway_origin
 from .gateway import AdminError
 
 
@@ -47,6 +50,14 @@ def open_browser(url: str) -> bool:
         return False
 
 
+def connectable(url: str) -> bool:
+    try:
+        gateway_origin(url)
+    except ValueError:
+        return False
+    return True
+
+
 def origin(url: object) -> str | None:
     if not isinstance(url, str):
         return None
@@ -68,7 +79,7 @@ class CredentialStore:
         self.directory = directory
 
     def path(self, gateway: str) -> Path:
-        return self.directory / f"{quote(gateway, safe='')}.json"
+        return self.directory / f"{quote(origin(gateway), safe='')}.json"
 
     def load(self, gateway: str) -> dict | None:
         try:
@@ -175,13 +186,16 @@ class BrowserSignIn:
                 self._pending = await self._start(signed_in)
             return self._pending
 
+    async def saved(self) -> str | None:
+        async with self._lock:
+            return await self._stored()
+
     async def credential(self, signed_in: Callable[[], Awaitable[None]] | None = None) -> str:
         found = await self.begin(signed_in)
-        if isinstance(found, str):
-            return found
-        if not await asyncio.shield(found.opened) and not found.callback.outcome.done():
+        key = found if isinstance(found, str) else await self.settled(found)
+        if key is None:
             raise AdminError(f"{found.link}, then repeat the request.", 401)
-        return await asyncio.shield(found.task)
+        return key
 
     async def settled(self, pending: Pending) -> str | None:
         if not await asyncio.shield(pending.opened) and not pending.callback.outcome.done():
@@ -191,6 +205,15 @@ class BrowserSignIn:
                 return await asyncio.shield(pending.task)
         except TimeoutError:
             return None
+
+    async def renew(self, credential: str) -> str | None:
+        async with self._lock:
+            record = self.store.load(self.gateway)
+            if record is None:
+                return None
+            if record["access_token"] != credential:
+                return record["access_token"]
+            return await self._refresh(record)
 
     async def forget(self, credential: str):
         record = self.store.load(self.gateway)
@@ -207,10 +230,14 @@ class BrowserSignIn:
             raise AdminError("The gateway could not record the sign-out right now. Nothing was removed; "
                              "run logout again shortly.", 503)
         self.store.save(self.gateway, None)
+        until = datetime.fromtimestamp(record["expires_at"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        lasting = (f" The access token it last issued stays valid at the gateway until {until}."
+                   if self.now() < record["expires_at"] else "")
         if status is not None and 200 <= status < 300:
-            return f"Signed out of {self.gateway}. The gateway revoked the sign-in and its saved copy was removed."
-        return (f"Removed the saved sign-in for {self.gateway}, but the gateway did not confirm revoking it "
-                f"({'no answer' if status is None else f'HTTP {status}'}); it stops renewing when it expires.")
+            return (f"Signed out of {self.gateway}. The gateway revoked the sign-in's refresh token, so it is no longer "
+                    f"renewed, and its saved copy was removed.{lasting}")
+        return (f"Removed the saved sign-in for {self.gateway}, but the gateway did not confirm revoking its refresh "
+                f"token ({'no answer' if status is None else f'HTTP {status}'}).{lasting}")
 
     async def _stored(self) -> str | None:
         record = self.store.load(self.gateway)
@@ -218,13 +245,22 @@ class BrowserSignIn:
             return None
         if self.now() < record["expires_at"] - REFRESH_MARGIN_SECONDS:
             return record["access_token"]
+        with suppress(AdminError):
+            renewed = await self._refresh(record)
+            if renewed is not None:
+                return renewed
+        return record["access_token"] if self.now() < record["expires_at"] else None
+
+    async def _refresh(self, record: dict) -> str | None:
         try:
             renewed = await self._token(record, grant_type="refresh_token", refresh_token=record["refresh_token"])
-        except AdminError:
+        except AdminError as exc:
             latest = self.store.load(self.gateway)
             if latest is not None and latest["refresh_token"] != record["refresh_token"] and self.now() < latest["expires_at"]:
                 return latest["access_token"]
-            return record["access_token"] if self.now() < record["expires_at"] else None
+            if exc.status != 401:
+                raise
+            return None
         self.store.save(self.gateway, renewed)
         return renewed["access_token"]
 
@@ -261,10 +297,7 @@ class BrowserSignIn:
                                    redirect_uri=callback.redirect_uri, code_verifier=verifier)
         self.store.save(self.gateway, record)
         if signed_in is not None:
-            try:
-                await signed_in()
-            except Exception:
-                pass
+            await signed_in()
         return record["access_token"]
 
     async def _discover(self) -> dict:
@@ -277,8 +310,10 @@ class BrowserSignIn:
             raise AdminError("The gateway's sign-in discovery document is unsupported; upgrade LiteLLM or set LITELLM_API_KEY.", 502)
         elsewhere = sorted(origins - {origin(self.gateway)})
         if elsewhere:
+            alternative = (f", or set LITELLM_BASE_URL to {elsewhere[0]} if that is this gateway's own address"
+                           if len(elsewhere) == 1 and connectable(elsewhere[0]) else "")
             raise AdminError(f"The gateway's sign-in discovery names {', '.join(elsewhere)} instead of {origin(self.gateway)}. "
-                             "If that is this gateway's own address, set LITELLM_BASE_URL to it.", 502)
+                             f"Set PROXY_BASE_URL on the gateway to {self.gateway}{alternative}.", 502)
         return contract
 
     async def _register(self, endpoint: str, redirect_uri: str) -> str:

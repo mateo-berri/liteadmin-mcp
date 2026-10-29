@@ -30,7 +30,7 @@ async def sign_out(config: Config) -> str:
 def main():
     parser = argparse.ArgumentParser(description="LiteLLM Admin MCP connector")
     parser.add_argument("command", nargs="?", choices=["logout"],
-                        help="logout revokes and removes the saved browser sign-in for LITELLM_BASE_URL")
+                        help="logout revokes the saved browser sign-in's refresh token and removes the sign-in for LITELLM_BASE_URL")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
