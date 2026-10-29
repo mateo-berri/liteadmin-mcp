@@ -42,18 +42,22 @@ server to a client that supports local MCP processes:
 }
 ```
 
-When your client starts the connector without a saved sign-in, the connector lists a
-single `sign_in` tool and opens nothing. When you ask your agent to work with the
-gateway, it calls `sign_in`, which opens your browser on the gateway's sign-in page.
-Sign in as a proxy admin and approve the request. The connector then tells the client
-that its tools changed, and the gateway's admin tools replace `sign_in`. The `sign_in`
-tool waits up to 40 seconds for approval and answers within a minute, so clients with
-a one-minute tool timeout get its answer. If the browser window did not appear or you
-need longer, it returns the sign-in link, which stays usable for five minutes. When
-your agent runs on another computer, such as over SSH, open the link in your own
-browser and approve. The page it then opens does not load, because it points at the
-other computer. Give its full address to your agent, which calls `sign_in` with it as
-`callback_url` to finish signing in.
+When your client starts the connector without a saved sign-in, the connector lists the
+admin tools from its own catalog, with short schemas that point the agent at
+`describe_admin_tool`, plus a `sign_in` tool, and opens nothing. The first admin tool
+call opens your browser on the gateway's sign-in page instead of running. Sign in as a
+proxy admin and approve the request. The call then answers that the tool has not run
+yet, and your agent calls it again to run it, so this works in clients that do not
+reload their tool list. Clients that do reload it after the connector announces the
+change get the gateway's own tool list, without `sign_in`. A call that signs in waits
+up to 40 seconds for approval and answers within a minute, so clients with a
+one-minute tool timeout get its answer. If the browser window did not appear or you
+need longer, it returns the sign-in link, which stays usable for five minutes, and
+your agent repeats the call after you approve. When your agent runs on another
+computer, such as over SSH, open the link in your own browser and approve. The page it
+then opens does not load, because it points at the other computer. Give its full
+address to your agent, which calls `sign_in` with it as `callback_url` to finish
+signing in.
 
 The connector saves the sign-in under `~/.config/litellm-admin-mcp/sign-ins/`
 (under `$XDG_CONFIG_HOME` when set), one file per gateway, readable only by you, and
@@ -64,10 +68,10 @@ It revokes the sign-in's refresh token at the gateway, so the sign-in is no long
 renewed, and removes the saved file. The access token the gateway last issued stays
 valid until it expires, and `logout` prints that time. When the gateway rejects the
 saved access token, the connector renews it once. A sign-in that still fails, or one
-for a user who is not a proxy admin, is revoked and removed the same way, and only
-`sign_in` is listed again. Browser sign-in needs a gateway that publishes
-`/.well-known/litellm-cli-auth` (LiteLLM v1.99.0 or later), and the admin tools also
-need the `admin_mcp_permissions` support described above.
+for a user who is not a proxy admin, is revoked and removed the same way, and the next
+admin tool call opens the browser sign-in again. Browser sign-in needs a gateway that
+publishes `/.well-known/litellm-cli-auth` (LiteLLM v1.99.0 or later), and the admin
+tools also need the `admin_mcp_permissions` support described above.
 
 To use an existing key instead, add `"LITELLM_API_KEY": "<your-personal-proxy-admin-key>"`
 to `env`. The connector then never opens a browser. Use your client's secret storage

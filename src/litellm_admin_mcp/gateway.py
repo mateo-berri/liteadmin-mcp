@@ -11,7 +11,7 @@ import httpx2
 import jsonschema
 from mcp import types
 
-from .catalog import BY_NAME, OPERATIONS
+from .catalog import BY_NAME, OPERATIONS, Operation
 from .config import Config
 from .schema import SchemaError, discovery_schema, tool_schema
 from .results import (MAX_RESULT_BYTES, PAGE_BYTES, READ_SCHEMA, RESPONSE_SCHEMA,
@@ -27,6 +27,7 @@ HELPERS = {
     "describe_admin_tool": (DESCRIBE_SCHEMA, "Read the complete input schema and annotations of an enabled tool, including all advanced arguments and referenced definitions. Required before using a tool in discovery schema mode. Returns full detail by default; response.view=compact pages unusually large schemas."),
     "read_admin_result": (READ_SCHEMA, "Read an exact saved result without re-executing its operation. Browse fields, array items and string chunks using returned paths/next arguments. view=full returns the entire selected value. Snapshots expire after five minutes; never repeat a write to recover its response."),
 }
+OFFLINE_SCHEMA = {"properties": {**dict.fromkeys(("body", "query", "path"), {}), "response": RESPONSE_SCHEMA}}
 
 
 class AdminError(Exception):
@@ -44,6 +45,25 @@ class NotAdmin(AdminError):
 class Authorization:
     principal: str
     tools: frozenset[str]
+
+
+def catalog_tool(item: Operation, schema: dict) -> types.Tool:
+    effect = ("Read-only." if item.read_only
+              else "Changes gateway state; execute only when requested. Never retry an uncertain write.")
+    return types.Tool(name=item.name, description=f"{item.summary}. {item.method} {item.path}. {effect}",
+        inputSchema=schema, annotations=types.ToolAnnotations(readOnlyHint=item.read_only,
+            destructiveHint=not item.read_only, idempotentHint=item.read_only, openWorldHint=True))
+
+
+def discovered(tool: types.Tool) -> types.Tool:
+    return tool.model_copy(update={"input_schema": discovery_schema(tool.input_schema, tool.name),
+        "description": tool.description + " Call describe_admin_tool for the complete argument schema before use."})
+
+
+def helper_tools() -> dict[str, types.Tool]:
+    return {name: types.Tool(name=name, description=description, inputSchema=schema, annotations=types.ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+        for name, (schema, description) in HELPERS.items()}
 
 
 def valid_credential(value: str) -> str:
@@ -161,17 +181,17 @@ class Gateway:
     async def tools(self, credential: str) -> dict[str, types.Tool]:
         authorization = await self._authorization(credential)
         canonical = await self._load_tools(credential)
-        visible = {}
-        for name, tool in canonical.items():
-            if name not in authorization.tools:
-                continue
-            visible[name] = (tool.model_copy(update={"input_schema": discovery_schema(tool.input_schema, name),
-                "description": tool.description + " Call describe_admin_tool for the complete argument schema before use."})
-                if self.config.schema_mode == "discovery" else tool)
-        for name, (schema, description) in HELPERS.items():
-            visible[name] = types.Tool(name=name, description=description, inputSchema=schema,
-                annotations=types.ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
-        return visible
+        visible = {name: discovered(tool) if self.config.schema_mode == "discovery" else tool
+                   for name, tool in canonical.items() if name in authorization.tools}
+        return {**visible, **helper_tools()}
+
+    def offline_tools(self) -> dict[str, types.Tool]:
+        enabled = (item for item in OPERATIONS if self._enabled(item))
+        return {**{item.name: discovered(catalog_tool(item, OFFLINE_SCHEMA)) for item in enabled}, **helper_tools()}
+
+    def _enabled(self, item: Operation) -> bool:
+        return (not self.config.allowed_tools or item.name in self.config.allowed_tools) and (
+            item.read_only or not self.config.read_only)
 
     async def _load_tools(self, credential: str) -> dict[str, types.Tool]:
         async with self._schema_lock:
@@ -182,9 +202,7 @@ class Gateway:
                 raise AdminError("Gateway OpenAPI schema is unavailable.", 503)
             selected = {}
             for item in OPERATIONS:
-                if self.config.allowed_tools and item.name not in self.config.allowed_tools:
-                    continue
-                if self.config.read_only and not item.read_only:
+                if not self._enabled(item):
                     continue
                 path = spec["paths"].get(item.path, {})
                 operation = path.get(item.method.lower())
@@ -198,14 +216,7 @@ class Gateway:
                     jsonschema.Draft202012Validator.check_schema(schema)
                 except (SchemaError, jsonschema.SchemaError, TypeError, KeyError):
                     raise AdminError(f"Gateway schema is unsupported for {item.name}.", 503) from None
-                selected[item.name] = types.Tool(
-                    name=item.name, description=f"{item.summary}. {item.method} {item.path}. "
-                    + ("Read-only." if item.read_only else "Changes gateway state; execute only when requested. Never retry an uncertain write."),
-                    inputSchema=schema, annotations=types.ToolAnnotations(
-                        readOnlyHint=item.read_only, destructiveHint=not item.read_only,
-                        idempotentHint=item.read_only, openWorldHint=True,
-                    ),
-                )
+                selected[item.name] = catalog_tool(item, schema)
             if not selected:
                 raise AdminError("No compatible, enabled admin tools were found on this gateway.", 503)
             self._tools = selected
