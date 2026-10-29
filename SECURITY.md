@@ -6,8 +6,10 @@ HTTP redirect. It exposes only reviewed operations present in the gateway's spec
 
 Local stdio runs with the administrator's configured gateway credential or, when
 none is configured, one from the gateway's browser sign-in. That sign-in uses PKCE
-with a loopback redirect on 127.0.0.1, accepts only the pending request's state,
-and sends nothing to endpoints outside the configured gateway's origin. The
+with a loopback redirect on 127.0.0.1, accepts only the pending request's state
+(at the loopback listener or in an address the user pastes back as `callback_url`
+when the browser runs on another computer), redeems the code only with that
+request's PKCE verifier, and sends nothing to endpoints outside the configured gateway's origin. The
 resulting access and refresh tokens are kept in an owner-only file (mode 0600 in a
 0700 directory) keyed by gateway origin. A sign-in the gateway still rejects after
 one renewal is revoked and removed. Hosted

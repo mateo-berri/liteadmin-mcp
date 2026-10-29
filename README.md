@@ -47,9 +47,13 @@ single `sign_in` tool and opens nothing. When you ask your agent to work with th
 gateway, it calls `sign_in`, which opens your browser on the gateway's sign-in page.
 Sign in as a proxy admin and approve the request. The connector then tells the client
 that its tools changed, and the gateway's admin tools replace `sign_in`. The `sign_in`
-tool waits up to a minute for approval. If the browser window did not appear or you
-need longer, it returns the sign-in link to open on the same computer, which stays
-usable for five minutes.
+tool waits up to 40 seconds for approval and answers within a minute, so clients with
+a one-minute tool timeout get its answer. If the browser window did not appear or you
+need longer, it returns the sign-in link, which stays usable for five minutes. When
+your agent runs on another computer, such as over SSH, open the link in your own
+browser and approve. The page it then opens does not load, because it points at the
+other computer. Give its full address to your agent, which calls `sign_in` with it as
+`callback_url` to finish signing in.
 
 The connector saves the sign-in under `~/.config/litellm-admin-mcp/sign-ins/`
 (under `$XDG_CONFIG_HOME` when set), one file per gateway, readable only by you, and

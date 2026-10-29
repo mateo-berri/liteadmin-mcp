@@ -172,6 +172,14 @@ async def test_first_tool_call_signs_in_through_the_browser_and_later_runs_reuse
     assert len(gateway.clients) == 1
 
 
+def test_saving_a_sign_in_makes_an_existing_store_directory_owner_only(tmp_path):
+    store = CredentialStore(tmp_path / "sign-ins")
+    store.directory.mkdir()
+    store.directory.chmod(0o755)
+    store.save(GATEWAY, {"access_token": "signed-in-admin-1"})
+    assert stat.S_IMODE(store.directory.stat().st_mode) == 0o700
+
+
 async def test_expiring_sign_in_is_renewed_and_an_unrenewable_one_signs_in_again(tmp_path):
     gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
     async with signed_in_session(gateway, store, Browser(gateway)) as session:
@@ -201,6 +209,28 @@ async def test_failed_renewal_keeps_using_the_sign_in_until_it_expires(tmp_path)
         data(await session.call_tool("create_key", {"body": {"key_alias": "still-valid"}}))
     assert browser.urls == []
     assert authorizations(gateway) == ["Bearer signed-in-admin-1"] * 2
+
+
+async def test_expired_sign_in_the_gateway_cannot_renew_right_now_is_kept_and_no_new_sign_in_starts(tmp_path):
+    gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
+    async with signed_in_session(gateway, store, Browser(gateway)) as session:
+        data(await session.call_tool("list_keys", {}))
+
+    def token_endpoint_down(request):
+        if request.url.path == "/token":
+            return httpx2.Response(503, json={})
+        return gateway.handle(request)
+
+    browser = Browser(gateway)
+    async with signed_in_session(gateway, store, browser, handler=token_endpoint_down,
+                                 now=lambda: time.time() + 2 * 3600) as session:
+        with pytest.raises(MCPError, match="has expired and could not be renewed"):
+            await session.list_tools()
+        assert "could not be renewed: The gateway's token request failed with HTTP 503" in text(
+            await session.call_tool("list_keys", {}))
+        assert "could not be renewed" in text(await session.call_tool("sign_in", {}))
+    assert browser.urls == [] and len(gateway.clients) == 1
+    assert store.load(GATEWAY)["refresh_token"] == "refresh-1" and gateway.revocations == []
 
 
 async def test_abandoned_sign_in_times_out_and_the_next_request_starts_a_new_one(tmp_path):
@@ -273,10 +303,46 @@ async def test_admin_tool_call_returns_the_sign_in_link_instead_of_waiting_for_t
     gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
     opened = []
     async with signed_in_session(gateway, store, Browser(gateway), link_after=.2, timeout=30,
-                                 open_browser=lambda url: opened.append(url) or True) as session:
-        async with asyncio.timeout(5):
+                                 open_browser=lambda url: opened.append(url) or time.sleep(1.5) or True) as session:
+        async with asyncio.timeout(1):
             waiting = text(await session.call_tool("list_keys", {}))
-    assert sign_in_link(waiting) == opened[0] and waiting.endswith(", then repeat the request.")
+    assert sign_in_link(waiting) == opened[0] and ", then repeat the request. If that browser runs on another" in waiting
+
+
+async def test_sign_in_answers_in_time_while_a_slow_gateway_is_still_loading_the_admin_tools(tmp_path):
+    gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
+
+    async def slow_schema(request):
+        if request.url.path == "/openapi.json":
+            await asyncio.sleep(2)
+        return gateway.handle(request)
+
+    async with signed_in_session(gateway, store, Browser(gateway), handler=slow_schema, answer_within=.5) as session:
+        assert [tool.name for tool in (await session.list_tools()).tools] == ["sign_in"]
+        async with asyncio.timeout(1.5):
+            signed_in = await session.call_tool("sign_in", {})
+        assert "Signed in to LiteLLM as signed-in-admin-1" in signed_in.content[0].text
+        assert "create_key" in {tool.name for tool in (await session.list_tools()).tools}
+    assert [request.url.path for request in gateway.requests].count("/openapi.json") == 1
+
+
+async def test_sign_in_finishes_from_the_address_a_browser_on_another_computer_could_not_open(tmp_path):
+    gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
+    browser = Browser(gateway, opens=False)
+    async with signed_in_session(gateway, store, browser) as session:
+        early = text(await session.call_tool("sign_in", {"callback_url": "http://127.0.0.1:9/callback?code=x&state=y"}))
+        assert "No LiteLLM sign-in is waiting" in early and browser.urls == []
+        waiting = (await session.call_tool("sign_in", {})).content[0].text
+        assert "call sign_in with it as callback_url" in waiting
+        landed = gateway.approve(sign_in_link(waiting))
+        forged = landed.replace("state=", "state=forged")
+        assert "does not belong to the pending LiteLLM sign-in" in text(
+            await session.call_tool("sign_in", {"callback_url": forged}))
+        signed_in = await session.call_tool("sign_in", {"callback_url": landed})
+        assert not signed_in.is_error and "Signed in to LiteLLM as signed-in-admin-1" in signed_in.content[0].text
+        data(await session.call_tool("create_key", {"body": {"key_alias": "remote"}}))
+    assert len(browser.urls) == 1
+    assert authorizations(gateway) == ["Bearer signed-in-admin-1"]
 
 
 async def test_sign_in_finds_a_sign_in_saved_by_another_session_and_lists_the_admin_tools(tmp_path):
@@ -426,7 +492,8 @@ async def test_write_rejected_after_it_ran_is_not_repeated_and_the_next_one_uses
     assert gateway.revocations == []
 
 
-async def test_gateway_outage_while_renewing_a_rejected_sign_in_keeps_it(tmp_path):
+@pytest.mark.parametrize("status, body", [(503, {}), (429, {"error": "slow_down"}), (400, {"error": "invalid_request"})])
+async def test_gateway_outage_while_renewing_a_rejected_sign_in_keeps_it(tmp_path, status, body):
     gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
     async with signed_in_session(gateway, store, Browser(gateway)) as session:
         data(await session.call_tool("list_keys", {}))
@@ -434,11 +501,11 @@ async def test_gateway_outage_while_renewing_a_rejected_sign_in_keeps_it(tmp_pat
 
     def token_endpoint_down(request):
         if request.url.path == "/token":
-            return httpx2.Response(503, json={})
+            return httpx2.Response(status, json=body)
         return gateway.handle(request)
 
     async with signed_in_session(gateway, store, Browser(gateway, opens=False), handler=token_endpoint_down) as session:
-        assert "token request failed with HTTP 503" in text(await session.call_tool("list_keys", {}))
+        assert f"token request failed with HTTP {status}" in text(await session.call_tool("list_keys", {}))
     assert store.load(GATEWAY)["access_token"] == "signed-in-admin-1" and gateway.revocations == []
 
 

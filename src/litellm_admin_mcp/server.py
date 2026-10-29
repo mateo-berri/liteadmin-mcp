@@ -1,4 +1,5 @@
 """Standard MCP transports; no agent, model inference or Slack dependency."""
+import asyncio
 from contextlib import asynccontextmanager, suppress
 import json
 
@@ -15,14 +16,17 @@ from starlette.routing import Route
 from . import __version__
 from .catalog import BY_NAME
 from .gateway import HELPERS, AdminError, Gateway, NotAdmin, valid_credential
-from .signin import BrowserSignIn, Pending
+from .signin import ELSEWHERE, LINK_AFTER_SECONDS, BrowserSignIn, Pending
 
 
-SIGN_IN = types.Tool(name="sign_in", inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+SIGN_IN = types.Tool(name="sign_in", inputSchema={"type": "object", "properties": {"callback_url": {"type": "string",
+    "description": "Only when the browser that approved the sign-in runs on another computer: the full address of the "
+    "page it opened after approval, which does not load."}}, "additionalProperties": False},
     description="Sign in to the LiteLLM gateway as a proxy admin through the browser. The gateway's admin tools "
-    "(virtual keys, teams, budgets, models, spend and logs) are listed once sign-in completes. Waits up to a minute "
-    "for approval in the browser window it opens, and otherwise returns the sign-in link to show the user.",
-    annotations=types.ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+    "(virtual keys, teams, budgets, models, spend and logs) are listed once sign-in completes. Waits up to "
+    f"{LINK_AFTER_SECONDS} seconds for approval in the browser window it opens, and otherwise returns the sign-in link "
+    "to show the user.",
+    annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 
 
 def bearer(headers) -> str:
@@ -72,13 +76,21 @@ def create_server(gateway: Gateway, *, http: bool = False, sign_in: BrowserSignI
         await announcer(context)()
         raise AdminError(f"{failure} The saved LiteLLM sign-in was removed; call sign_in to sign in again.", failure.status)
 
-    async def signed_in(context):
-        found = await sign_in.begin(announcer(context))
-        key = await sign_in.settled(found) if isinstance(found, Pending) else found
-        if key is None:
-            return f"{found.link}, then call sign_in again."
+    async def signed_in(context, callback_url):
+        deadline = asyncio.get_running_loop().time() + sign_in.answer_within
+        if callback_url is not None:
+            key = await sign_in.complete(callback_url if isinstance(callback_url, str) else "")
+        else:
+            found = await sign_in.begin(announcer(context))
+            key = await sign_in.settled(found) if isinstance(found, Pending) else found
+            if key is None:
+                return f"{found.link}, then call sign_in again.{ELSEWHERE}"
         principal = await authenticated(context, key, gateway.authorize)
-        await authenticated(context, key, gateway.tools)
+        loading = asyncio.ensure_future(authenticated(context, key, gateway.tools))
+        loading.add_done_callback(lambda done: done.cancelled() or done.exception())
+        with suppress(TimeoutError):
+            async with asyncio.timeout_at(deadline):
+                await asyncio.shield(loading)
         await announcer(context)()
         return f"Signed in to LiteLLM as {principal}. The gateway's admin tools are now listed."
 
@@ -90,14 +102,15 @@ def create_server(gateway: Gateway, *, http: bool = False, sign_in: BrowserSignI
             tools = await authenticated(context, key, gateway.tools)
             return types.ListToolsResult(tools=list(tools.values()))
         except AdminError as exc:
-            if sign_in is not None and await sign_in.saved() is None:
+            if sign_in is not None and sign_in.signed_out():
                 return types.ListToolsResult(tools=[SIGN_IN])
             raise MCPError(-32001, str(exc)) from None
 
     async def call_tool(context, params):
         try:
             if sign_in is not None and params.name == SIGN_IN.name:
-                return types.CallToolResult(content=[types.TextContent(type="text", text=await signed_in(context))])
+                answer = await signed_in(context, (params.arguments or {}).get("callback_url"))
+                return types.CallToolResult(content=[types.TextContent(type="text", text=answer)])
             key = await credential(context)
             result = await authenticated(context, key, lambda key: gateway.call(params.name, params.arguments or {}, key),
                                          repeat=repeatable(params.name))

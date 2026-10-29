@@ -7,7 +7,6 @@ a self-renewing gateway credential issued for the proxy API. Signing out, or a c
 gateway still rejects after renewal, revokes its refresh token at the gateway's revocation endpoint."""
 import asyncio
 import base64
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -29,11 +28,15 @@ from .gateway import AdminError
 
 DISCOVERY_PATH = "/.well-known/litellm-cli-auth"
 SIGN_IN_SECONDS = 300
-LINK_AFTER_SECONDS = 60
+LINK_AFTER_SECONDS = 40
+ANSWER_WITHIN_SECONDS = 55
 REFRESH_MARGIN_SECONDS = 360
 CLIENT_NAME = "litellm-admin-mcp"
 RECORD_FIELDS = ("access_token", "refresh_token", "client_id", "token_endpoint", "revocation_endpoint", "resource")
 OPEN_BROWSER = "import sys, webbrowser; sys.exit(not webbrowser.open(sys.argv[1]))"
+REJECTED_GRANTS = ("invalid_grant", "invalid_client", "unauthorized_client")
+ELSEWHERE = (" If that browser runs on another computer, the page it opens after approval will not load. Copy that page's "
+             "full address from the address bar and call sign_in with it as callback_url.")
 
 
 def default_store_directory() -> Path:
@@ -97,6 +100,7 @@ class CredentialStore:
             path.unlink(missing_ok=True)
             return
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.directory.chmod(0o700)
         staged = path.with_name(f".{path.name}.{secrets.token_hex(8)}")
         with os.fdopen(os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as file:
             json.dump(record, file)
@@ -138,9 +142,12 @@ class Callback:
     def _settle(self, request_line: str) -> tuple[int, str]:
         method, _, rest = request_line.partition(" ")
         target = urlsplit(rest.rpartition(" ")[0])
-        params = {k: v[0] for k, v in parse_qs(target.query).items()}
         if method != "GET" or target.path != "/callback":
             return 404, "Not found."
+        return self.resolve(target.query)
+
+    def resolve(self, query: str) -> tuple[int, str]:
+        params = {k: v[0] for k, v in parse_qs(query).items()}
         if self.outcome.done() or not secrets.compare_digest(params.get("state", ""), self.state):
             return 400, "This response does not belong to the pending LiteLLM sign-in."
         if "error" in params:
@@ -161,7 +168,7 @@ class Pending:
 
     @property
     def link(self) -> str:
-        return f"Sign in to LiteLLM as a proxy admin by opening {self.url} in a browser on this computer"
+        return f"Sign in to LiteLLM as a proxy admin by opening {self.url} in a browser"
 
 
 class BrowserSignIn:
@@ -171,9 +178,11 @@ class BrowserSignIn:
 
     def __init__(self, gateway: str, client: httpx2.AsyncClient, store: CredentialStore, *,
                  open_browser: Callable[[str], bool] = open_browser, timeout: float = SIGN_IN_SECONDS,
-                 link_after: float = LINK_AFTER_SECONDS, now: Callable[[], float] = time.time):
+                 link_after: float = LINK_AFTER_SECONDS, answer_within: float = ANSWER_WITHIN_SECONDS,
+                 now: Callable[[], float] = time.time):
         self.gateway, self.client, self.store = gateway, client, store
         self.open_browser, self.timeout, self.link_after, self.now = open_browser, timeout, link_after, now
+        self.answer_within = answer_within
         self._lock = asyncio.Lock()
         self._pending: Pending | None = None
 
@@ -190,21 +199,37 @@ class BrowserSignIn:
         async with self._lock:
             return await self._stored()
 
+    def signed_out(self) -> bool:
+        return self.store.load(self.gateway) is None
+
     async def credential(self, signed_in: Callable[[], Awaitable[None]] | None = None) -> str:
         found = await self.begin(signed_in)
         key = found if isinstance(found, str) else await self.settled(found)
         if key is None:
-            raise AdminError(f"{found.link}, then repeat the request.", 401)
+            raise AdminError(f"{found.link}, then repeat the request.{ELSEWHERE}", 401)
         return key
 
     async def settled(self, pending: Pending) -> str | None:
-        if not await asyncio.shield(pending.opened) and not pending.callback.outcome.done():
-            return None
         try:
             async with asyncio.timeout(self.link_after):
+                if not await asyncio.shield(pending.opened) and not pending.callback.outcome.done():
+                    return None
                 return await asyncio.shield(pending.task)
         except TimeoutError:
             return None
+
+    async def complete(self, callback_url: str) -> str:
+        stored = await self.saved()
+        if stored is not None:
+            return stored
+        pending = self._pending
+        if pending is None or pending.task.done():
+            raise AdminError("No LiteLLM sign-in is waiting for that address. Call sign_in without callback_url to start "
+                             "a new one.", 400)
+        status, text = pending.callback.resolve(urlsplit(callback_url).query)
+        if status != 200:
+            raise AdminError(text, 400)
+        return await asyncio.shield(pending.task)
 
     async def renew(self, credential: str) -> str | None:
         async with self._lock:
@@ -245,10 +270,15 @@ class BrowserSignIn:
             return None
         if self.now() < record["expires_at"] - REFRESH_MARGIN_SECONDS:
             return record["access_token"]
-        with suppress(AdminError):
+        try:
             renewed = await self._refresh(record)
-            if renewed is not None:
-                return renewed
+        except AdminError as exc:
+            if self.now() < record["expires_at"]:
+                return record["access_token"]
+            raise AdminError(f"The saved LiteLLM sign-in has expired and could not be renewed: {exc} Try again shortly.",
+                             503) from None
+        if renewed is not None:
+            return renewed
         return record["access_token"] if self.now() < record["expires_at"] else None
 
     async def _refresh(self, record: dict) -> str | None:
@@ -355,7 +385,9 @@ class BrowserSignIn:
         except ValueError:
             body = None
         if not 200 <= response.status_code < 300 or not isinstance(body, dict):
-            detail = body.get("error_description") or body.get("error") if isinstance(body, dict) else None
+            error = body.get("error") if isinstance(body, dict) else None
+            detail = body.get("error_description") or error if isinstance(body, dict) else None
+            rejected = response.status_code == 401 or response.status_code == 400 and error in REJECTED_GRANTS
             raise AdminError(f"The gateway's {purpose} failed with HTTP {response.status_code}"
-                             + (f": {str(detail)[:200]}" if detail else "") + ".", 401 if 400 <= response.status_code < 500 else 502)
+                             + (f": {str(detail)[:200]}" if detail else "") + ".", 401 if rejected else 502)
         return body
