@@ -35,15 +35,26 @@ server to a client that supports local MCP processes:
         "litellm-admin-mcp"
       ],
       "env": {
-        "LITELLM_BASE_URL": "https://your-gateway.example.com",
-        "LITELLM_API_KEY": "<your-personal-proxy-admin-key>"
+        "LITELLM_BASE_URL": "https://your-gateway.example.com"
       }
     }
   }
 }
 ```
 
-Use your client's secret storage if available, and keep its configuration private.
+The first time a tool needs the gateway, the connector opens your browser on the
+gateway's sign-in page. Sign in as a proxy admin and approve the request, and the
+tool call continues. The connector saves that sign-in to
+`~/.config/litellm-admin-mcp/credentials.json` (under `$XDG_CONFIG_HOME` when set),
+readable only by you, and renews it before it expires, so later runs do not ask
+again. Delete the file to remove the saved sign-in. When no browser can be opened, the tool error
+carries the sign-in link to open on the same computer; repeat the request after
+approving. Browser sign-in needs LiteLLM v1.99.0 or later on the gateway.
+
+To use an existing key instead, add `"LITELLM_API_KEY": "<your-personal-proxy-admin-key>"`
+to `env`. The connector then never opens a browser. Use your client's secret storage
+if available, and keep its configuration private.
+
 The connector requires Python 3.12 or later; uv can install a compatible Python.
 
 This configuration automatically checks GitHub's `main` branch whenever your
@@ -247,8 +258,8 @@ own personal gateway credential:
 ```
 
 Client configuration varies; use a client that supports Streamable HTTP and
-bearer headers. This release uses API-key authentication, not a browser OAuth
-installation flow. Admin status is checked against the gateway on every request
+bearer headers. Hosted HTTP mode uses API-key authentication. Browser sign-in is
+only for local stdio runs. Admin status is checked against the gateway on every request
 and before releasing tool results. No shared admin credential is stored by the
 HTTP service.
 

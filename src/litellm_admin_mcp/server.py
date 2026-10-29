@@ -12,6 +12,7 @@ from starlette.routing import Route
 
 from . import __version__
 from .gateway import AdminError, Gateway, valid_credential
+from .signin import BrowserSignIn
 
 
 def bearer(headers) -> str:
@@ -21,24 +22,36 @@ def bearer(headers) -> str:
     return valid_credential(value)
 
 
-def create_server(gateway: Gateway, *, http: bool = False) -> Server:
-    def credential(context):
+def create_server(gateway: Gateway, *, http: bool = False, sign_in: BrowserSignIn | None = None) -> Server:
+    async def credential(context):
         if http:
             if context.request is None:
                 raise AdminError("Caller authentication required.", 401)
             return bearer(context.request.headers)
+        if sign_in is not None:
+            return await sign_in.credential(context.session.send_tool_list_changed)
         return valid_credential(gateway.config.api_key)
+
+    async def authenticated(context, action):
+        key = await credential(context)
+        try:
+            return await action(key)
+        except AdminError as exc:
+            if sign_in is None or exc.status != 401:
+                raise
+            sign_in.forget(key)
+            raise AdminError(f"{exc} The saved LiteLLM sign-in was rejected; the next request opens a new browser sign-in.", 401) from None
 
     async def list_tools(context, params):
         try:
-            tools = await gateway.tools(credential(context))
+            tools = await authenticated(context, gateway.tools)
             return types.ListToolsResult(tools=list(tools.values()))
         except AdminError as exc:
             raise MCPError(-32001, str(exc)) from None
 
     async def call_tool(context, params):
         try:
-            result = await gateway.call(params.name, params.arguments or {}, credential(context))
+            result = await authenticated(context, lambda key: gateway.call(params.name, params.arguments or {}, key))
             return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, separators=(",", ":")))])
         except AdminError as exc:
             return types.CallToolResult(isError=True, content=[types.TextContent(type="text", text=str(exc))])

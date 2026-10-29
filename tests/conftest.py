@@ -56,6 +56,7 @@ class StubGateway:
         self.spec = SPEC
         self.denied_tools = set()
         self.denied_paths = set()
+        self.admins = {"alice-admin", "bob-admin"}
 
     def handle(self, request):
         self.requests.append(request)
@@ -63,7 +64,7 @@ class StubGateway:
         if request.url.path == "/user/info" and token == "team-key":
             return httpx2.Response(404, json={"error": {"message": "User None not found"}})
         if request.url.path == "/user/info":
-            role = "proxy_admin" if token in {"alice-admin", "bob-admin"} and token not in self.revoked else "internal_user"
+            role = "proxy_admin" if token in self.admins and token not in self.revoked else "internal_user"
             tools = [op.name for op in OPERATIONS if op.name not in self.denied_tools]
             return httpx2.Response(200, json={
                 "user_id": token, "user_info": {"user_id": token, "user_role": role},
@@ -75,7 +76,7 @@ class StubGateway:
             })
         if request.url.path == "/openapi.json":
             return httpx2.Response(200, json=self.spec)
-        assert token in {"alice-admin", "bob-admin"}
+        assert token in self.admins
         assert request.headers["litellm-changed-by"] == token
         if request.method != "GET":
             self.writes.append(request)
@@ -111,12 +112,12 @@ def stub():
 
 
 @asynccontextmanager
-async def connected(gateway):
-    server = create_server(gateway)
+async def connected(gateway, message_handler=None, **options):
+    server = create_server(gateway, **options)
     async with create_client_server_memory_streams() as (client_streams, server_streams):
         async with anyio.create_task_group() as group:
             group.start_soon(server.run, *server_streams, server.create_initialization_options())
-            async with ClientSession(*client_streams) as session:
+            async with ClientSession(*client_streams, message_handler=message_handler) as session:
                 await session.initialize()
                 yield session
             group.cancel_scope.cancel()

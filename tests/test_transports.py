@@ -1,6 +1,8 @@
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import os
+import subprocess
 import sys
 
 from aiohttp import web
@@ -88,3 +90,11 @@ async def test_packaged_stdio_process_uses_only_explicit_gateway_credential(stub
                 assert data(await session.call_tool("read_admin_result", saved["full_read"])) == {"keys": stub.keys}
     assert len(stub.writes) == 1
     assert "unrelated-slack-secret" not in json.dumps([dict(r.headers) for r in stub.requests])
+
+
+def test_stdio_start_with_a_malformed_key_says_why():
+    started = subprocess.run([sys.executable, "-m", "litellm_admin_mcp"], capture_output=True, text=True, timeout=30, env={
+        **os.environ, "LITELLM_BASE_URL": "https://gateway.example.com", "LITELLM_API_KEY": "pasted with spaces"})
+    assert started.returncode == 1
+    assert "A personal LiteLLM admin credential is required." in started.stderr
+    assert "pasted with spaces" not in started.stderr

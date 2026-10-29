@@ -3,19 +3,23 @@ import asyncio
 import logging
 import sys
 
+from mcp.server.lowlevel import NotificationOptions
 from mcp.server.stdio import stdio_server
 import uvicorn
 
 from .config import Config
-from .gateway import Gateway, valid_credential
+from .gateway import AdminError, Gateway, valid_credential
 from .server import create_http_app, create_server
+from .signin import BrowserSignIn, CredentialStore, default_store_path
 
 
 async def run_stdio(config: Config):
-    valid_credential(config.api_key)
+    if config.api_key:
+        valid_credential(config.api_key)
     async with Gateway(config) as gateway, stdio_server() as (read, write):
-        server = create_server(gateway)
-        await server.run(read, write, server.create_initialization_options())
+        sign_in = None if config.api_key else BrowserSignIn(config.base_url, gateway.client, CredentialStore(default_store_path()))
+        server = create_server(gateway, sign_in=sign_in)
+        await server.run(read, write, server.create_initialization_options(NotificationOptions(tools_changed=sign_in is not None)))
 
 
 def main():
@@ -34,6 +38,8 @@ def main():
                         log_level="warning", access_log=False)
     except KeyboardInterrupt:
         pass
+    except AdminError as exc:
+        parser.exit(1, f"LiteLLM Admin MCP could not start: {exc}\n")
     except Exception as exc:
         # Transport exceptions can include response bodies/headers. Do not print them.
         parser.exit(1, f"LiteLLM Admin MCP could not start ({type(exc).__name__}). Check its configuration and gateway connection.\n")
