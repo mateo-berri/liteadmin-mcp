@@ -35,6 +35,11 @@ class AdminError(Exception):
         self.status = status
 
 
+class NotAdmin(AdminError):
+    def __init__(self):
+        super().__init__("Only current LiteLLM proxy admins may use these tools.", 403)
+
+
 @dataclass(frozen=True)
 class Authorization:
     principal: str
@@ -144,7 +149,7 @@ class Gateway:
                 or not isinstance(user.get("user_id"), str) or not user["user_id"]
                 or data.get("user_id") != user["user_id"] or user.get("blocked")
                 or user.get("deleted") or user.get("is_active") is False):
-            raise AdminError("Only current LiteLLM proxy admins may use these tools.", 403)
+            raise NotAdmin()
         permissions = data.get("admin_mcp_permissions")
         if (not isinstance(permissions, dict) or not isinstance(permissions.get("tools"), list)
                 or any(not isinstance(name, str) for name in permissions["tools"])):

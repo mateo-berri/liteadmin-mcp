@@ -3,7 +3,8 @@
 The gateway publishes its native-client contract at /.well-known/litellm-cli-auth (the
 same one `lite login --pkce` uses): register a public client with a loopback redirect,
 send the user's browser to /authorize with PKCE S256, then redeem the code at /token for
-a self-renewing gateway credential issued for the proxy API."""
+a self-renewing gateway credential issued for the proxy API, revoked at the gateway's revocation
+endpoint when it is signed out or rejected."""
 import asyncio
 import base64
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ import subprocess
 import sys
 import time
 from typing import Awaitable, Callable
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import httpx2
 
@@ -25,14 +26,15 @@ from .gateway import AdminError
 
 DISCOVERY_PATH = "/.well-known/litellm-cli-auth"
 SIGN_IN_SECONDS = 300
+LINK_AFTER_SECONDS = 60
 REFRESH_MARGIN_SECONDS = 360
 CLIENT_NAME = "litellm-admin-mcp"
-RECORD_FIELDS = ("access_token", "refresh_token", "client_id", "token_endpoint", "resource")
+RECORD_FIELDS = ("access_token", "refresh_token", "client_id", "token_endpoint", "revocation_endpoint", "resource")
 OPEN_BROWSER = "import sys, webbrowser; sys.exit(not webbrowser.open(sys.argv[1]))"
 
 
-def default_store_path() -> Path:
-    return Path(os.getenv("XDG_CONFIG_HOME") or Path.home() / ".config") / "litellm-admin-mcp" / "credentials.json"
+def default_store_directory() -> Path:
+    return Path(os.getenv("XDG_CONFIG_HOME") or Path.home() / ".config") / "litellm-admin-mcp" / "sign-ins"
 
 
 def open_browser(url: str) -> bool:
@@ -59,32 +61,35 @@ def origin(url: object) -> str | None:
 
 
 class CredentialStore:
-    """Owner-only JSON file holding one sign-in per gateway origin."""
+    """Owner-only JSON files, one per gateway origin, so runs against different gateways never
+    overwrite each other's sign-in."""
 
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(self, directory: Path):
+        self.directory = directory
 
-    def _records(self) -> dict:
-        try:
-            records = json.loads(self.path.read_text())
-        except (OSError, ValueError):
-            return {}
-        return records if isinstance(records, dict) else {}
+    def path(self, gateway: str) -> Path:
+        return self.directory / f"{quote(gateway, safe='')}.json"
 
     def load(self, gateway: str) -> dict | None:
-        record = self._records().get(gateway)
+        try:
+            record = json.loads(self.path(gateway).read_text())
+        except (OSError, ValueError):
+            return None
         if (not isinstance(record, dict) or any(not isinstance(record.get(f), str) or not record[f] for f in RECORD_FIELDS)
                 or not isinstance(record.get("expires_at"), (int, float))):
             return None
         return record
 
     def save(self, gateway: str, record: dict | None):
-        records = {k: v for k, v in self._records().items() if k != gateway} | ({gateway: record} if record else {})
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        staged = self.path.with_name(f".{self.path.name}.{secrets.token_hex(8)}")
+        path = self.path(gateway)
+        if record is None:
+            path.unlink(missing_ok=True)
+            return
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        staged = path.with_name(f".{path.name}.{secrets.token_hex(8)}")
         with os.fdopen(os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as file:
-            json.dump(records, file)
-        os.replace(staged, self.path)
+            json.dump(record, file)
+        os.replace(staged, path)
 
 
 class Callback:
@@ -139,9 +144,13 @@ class Callback:
 @dataclass(frozen=True)
 class Pending:
     url: str
-    opened: bool
+    opened: asyncio.Task
     callback: Callback
     task: asyncio.Task
+
+    @property
+    def link(self) -> str:
+        return f"Sign in to LiteLLM as a proxy admin by opening {self.url} in a browser on this computer"
 
 
 class BrowserSignIn:
@@ -151,29 +160,57 @@ class BrowserSignIn:
 
     def __init__(self, gateway: str, client: httpx2.AsyncClient, store: CredentialStore, *,
                  open_browser: Callable[[str], bool] = open_browser, timeout: float = SIGN_IN_SECONDS,
-                 now: Callable[[], float] = time.time):
+                 link_after: float = LINK_AFTER_SECONDS, now: Callable[[], float] = time.time):
         self.gateway, self.client, self.store = gateway, client, store
-        self.open_browser, self.timeout, self.now = open_browser, timeout, now
+        self.open_browser, self.timeout, self.link_after, self.now = open_browser, timeout, link_after, now
         self._lock = asyncio.Lock()
         self._pending: Pending | None = None
 
-    async def credential(self, signed_in: Callable[[], Awaitable[None]] | None = None) -> str:
+    async def begin(self, signed_in: Callable[[], Awaitable[None]] | None = None) -> str | Pending:
         async with self._lock:
             stored = await self._stored()
             if stored is not None:
                 return stored
             if self._pending is None or self._pending.task.done():
                 self._pending = await self._start(signed_in)
-            pending = self._pending
-        if not pending.opened and not pending.callback.outcome.done():
-            raise AdminError(f"Sign in to LiteLLM by opening {pending.url} in a browser on this computer, "
-                             "then repeat the request.", 401)
-        return await asyncio.shield(pending.task)
+            return self._pending
 
-    def forget(self, credential: str):
+    async def credential(self, signed_in: Callable[[], Awaitable[None]] | None = None) -> str:
+        found = await self.begin(signed_in)
+        if isinstance(found, str):
+            return found
+        if not await asyncio.shield(found.opened) and not found.callback.outcome.done():
+            raise AdminError(f"{found.link}, then repeat the request.", 401)
+        return await asyncio.shield(found.task)
+
+    async def settled(self, pending: Pending) -> str | None:
+        if not await asyncio.shield(pending.opened) and not pending.callback.outcome.done():
+            return None
+        try:
+            async with asyncio.timeout(self.link_after):
+                return await asyncio.shield(pending.task)
+        except TimeoutError:
+            return None
+
+    async def forget(self, credential: str):
         record = self.store.load(self.gateway)
         if record is not None and record["access_token"] == credential:
             self.store.save(self.gateway, None)
+            await self._revoke(record)
+
+    async def sign_out(self) -> str:
+        record = self.store.load(self.gateway)
+        if record is None:
+            return f"No saved LiteLLM sign-in for {self.gateway}."
+        status = await self._revoke(record)
+        if status == 503:
+            raise AdminError("The gateway could not record the sign-out right now. Nothing was removed; "
+                             "run logout again shortly.", 503)
+        self.store.save(self.gateway, None)
+        if status is not None and 200 <= status < 300:
+            return f"Signed out of {self.gateway}. The gateway revoked the sign-in and its saved copy was removed."
+        return (f"Removed the saved sign-in for {self.gateway}, but the gateway did not confirm revoking it "
+                f"({'no answer' if status is None else f'HTTP {status}'}); it stops renewing when it expires.")
 
     async def _stored(self) -> str | None:
         record = self.store.load(self.gateway)
@@ -182,8 +219,7 @@ class BrowserSignIn:
         if self.now() < record["expires_at"] - REFRESH_MARGIN_SECONDS:
             return record["access_token"]
         try:
-            renewed = await self._token(record["token_endpoint"], record["resource"], record["client_id"],
-                                        grant_type="refresh_token", refresh_token=record["refresh_token"])
+            renewed = await self._token(record, grant_type="refresh_token", refresh_token=record["refresh_token"])
         except AdminError:
             latest = self.store.load(self.gateway)
             if latest is not None and latest["refresh_token"] != record["refresh_token"] and self.now() < latest["expires_at"]:
@@ -206,8 +242,10 @@ class BrowserSignIn:
             "response_type": "code", "client_id": client_id, "redirect_uri": callback.redirect_uri, "state": state,
             "code_challenge": challenge, "code_challenge_method": "S256", "resource": contract["resource"]})
         task = asyncio.create_task(self._finish(contract, callback, client_id, verifier, signed_in))
-        task.add_done_callback(lambda done: done.cancelled() or done.exception())
-        return Pending(url, await asyncio.to_thread(self.open_browser, url), callback, task)
+        opened = asyncio.create_task(asyncio.to_thread(self.open_browser, url))
+        for started in (task, opened):
+            started.add_done_callback(lambda done: done.cancelled() or done.exception())
+        return Pending(url, opened, callback, task)
 
     async def _finish(self, contract: dict, callback: Callback, client_id: str, verifier: str,
                       signed_in: Callable[[], Awaitable[None]] | None) -> str:
@@ -219,9 +257,8 @@ class BrowserSignIn:
                              "start a new one.", 401) from None
         finally:
             await callback.close()
-        record = await self._token(contract["token_endpoint"], contract["resource"], client_id,
-                                   grant_type="authorization_code", code=code, redirect_uri=callback.redirect_uri,
-                                   code_verifier=verifier)
+        record = await self._token({**contract, "client_id": client_id}, grant_type="authorization_code", code=code,
+                                   redirect_uri=callback.redirect_uri, code_verifier=verifier)
         self.store.save(self.gateway, record)
         if signed_in is not None:
             try:
@@ -232,10 +269,16 @@ class BrowserSignIn:
 
     async def _discover(self) -> dict:
         contract = await self._json("GET", self.gateway + DISCOVERY_PATH, "sign-in discovery")
-        endpoints = ("issuer", "authorization_endpoint", "token_endpoint", "registration_endpoint", "resource")
+        endpoints = ("issuer", "authorization_endpoint", "token_endpoint", "registration_endpoint",
+                     "revocation_endpoint", "resource")
+        origins = {origin(contract.get(name)) for name in endpoints}
         if (contract.get("contract_version") != 1 or "S256" not in contract.get("code_challenge_methods_supported", ())
-                or any(origin(contract.get(name)) != origin(self.gateway) for name in endpoints)):
-            raise AdminError("The gateway's sign-in discovery document is unsupported or names another server.", 502)
+                or None in origins):
+            raise AdminError("The gateway's sign-in discovery document is unsupported; upgrade LiteLLM or set LITELLM_API_KEY.", 502)
+        elsewhere = sorted(origins - {origin(self.gateway)})
+        if elsewhere:
+            raise AdminError(f"The gateway's sign-in discovery names {', '.join(elsewhere)} instead of {origin(self.gateway)}. "
+                             "If that is this gateway's own address, set LITELLM_BASE_URL to it.", 502)
         return contract
 
     async def _register(self, endpoint: str, redirect_uri: str) -> str:
@@ -246,16 +289,24 @@ class BrowserSignIn:
             raise AdminError("The gateway's client registration returned no client_id.", 502)
         return client["client_id"]
 
-    async def _token(self, endpoint: str, resource: str, client_id: str, **form: str) -> dict:
-        token = await self._json("POST", endpoint, "token request",
-                                 data={**form, "client_id": client_id, "resource": resource})
+    async def _token(self, endpoints: dict, **form: str) -> dict:
+        token = await self._json("POST", endpoints["token_endpoint"], "token request",
+                                 data={**form, "client_id": endpoints["client_id"], "resource": endpoints["resource"]})
         if (not isinstance(token.get("access_token"), str) or not token["access_token"]
                 or not isinstance(token.get("refresh_token"), str) or not token["refresh_token"]
                 or not isinstance(token.get("expires_in"), int) or token["expires_in"] <= 0):
             raise AdminError("The gateway's token response is unsupported.", 502)
         return {"access_token": token["access_token"], "refresh_token": token["refresh_token"],
-                "expires_at": self.now() + token["expires_in"], "client_id": client_id,
-                "token_endpoint": endpoint, "resource": resource}
+                "expires_at": self.now() + token["expires_in"],
+                **{name: endpoints[name] for name in ("client_id", "token_endpoint", "revocation_endpoint", "resource")}}
+
+    async def _revoke(self, record: dict) -> int | None:
+        try:
+            response = await self.client.post(record["revocation_endpoint"], follow_redirects=False, data={
+                "token": record["refresh_token"], "token_type_hint": "refresh_token", "client_id": record["client_id"]})
+        except httpx2.RequestError:
+            return None
+        return response.status_code
 
     async def _json(self, method: str, url: str, purpose: str, **kwargs) -> dict:
         try:

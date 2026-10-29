@@ -42,14 +42,23 @@ server to a client that supports local MCP processes:
 }
 ```
 
-The first time a tool needs the gateway, the connector opens your browser on the
-gateway's sign-in page. Sign in as a proxy admin and approve the request, and the
-tool call continues. The connector saves that sign-in to
-`~/.config/litellm-admin-mcp/credentials.json` (under `$XDG_CONFIG_HOME` when set),
-readable only by you, and renews it before it expires, so later runs do not ask
-again. Delete the file to remove the saved sign-in. When no browser can be opened, the tool error
-carries the sign-in link to open on the same computer; repeat the request after
-approving. Browser sign-in needs LiteLLM v1.99.0 or later on the gateway.
+When your client starts the connector without a saved sign-in, the connector opens
+your browser on the gateway's sign-in page and lists a single `sign_in` tool. Sign in
+as a proxy admin and approve the request. The connector then tells the client that its
+tools changed, and the gateway's admin tools replace `sign_in`. If the browser window
+did not appear or was closed, ask your agent to sign in to LiteLLM: the `sign_in` tool
+opens the page again, waits up to a minute for approval, and otherwise returns the
+sign-in link to open on the same computer.
+
+The connector saves the sign-in under `~/.config/litellm-admin-mcp/sign-ins/`
+(under `$XDG_CONFIG_HOME` when set), one file per gateway, readable only by you, and
+renews it before it expires, so later runs do not ask again. To sign out, run the
+same command with `logout`, for example
+`LITELLM_BASE_URL=https://your-gateway.example.com uvx --from git+https://github.com/BerriAI/litellm-admin-mcp.git@main litellm-admin-mcp logout`.
+It revokes the sign-in at the gateway and removes the saved file. A sign-in the
+gateway rejects, or one for a user who is not a proxy admin, is revoked and removed
+the same way, and the next request opens a new browser sign-in. Browser sign-in
+needs LiteLLM v1.99.0 or later on the gateway.
 
 To use an existing key instead, add `"LITELLM_API_KEY": "<your-personal-proxy-admin-key>"`
 to `env`. The connector then never opens a browser. Use your client's secret storage
