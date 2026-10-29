@@ -203,13 +203,6 @@ class BrowserSignIn:
     def signed_out(self) -> bool:
         return self.store.load(self.gateway) is None
 
-    async def credential(self, signed_in: Callable[[], Awaitable[None]] | None = None) -> str:
-        found = await self.begin(signed_in)
-        key = found if isinstance(found, str) else await self.settled(found)
-        if key is None:
-            raise AdminError(f"{found.link}, then repeat the request.{ELSEWHERE}", 401)
-        return key
-
     async def settled(self, pending: Pending) -> str | None:
         try:
             async with asyncio.timeout(self.link_after):

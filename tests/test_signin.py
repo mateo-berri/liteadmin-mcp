@@ -792,7 +792,8 @@ async def test_logout_revokes_the_refresh_token_removes_the_sign_in_and_says_how
         browser = Browser(gateway)
         async with httpx2.AsyncClient() as client:
             store = CredentialStore(tmp_path / "config" / "litellm-admin-mcp" / "sign-ins")
-            assert await BrowserSignIn(url, client, store, open_browser=browser.open).credential() == "signed-in-admin-1"
+            sign_in = BrowserSignIn(url, client, store, open_browser=browser.open)
+            assert await sign_in.settled(await sign_in.begin()) == "signed-in-admin-1"
         gateway.revocation_status = revocation_status
         returncode, output = await logout(url, tmp_path)
         assert (returncode, said in output) == (exit_code, True), output
