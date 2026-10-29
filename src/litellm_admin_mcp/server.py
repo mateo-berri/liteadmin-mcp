@@ -78,8 +78,8 @@ def create_server(gateway: Gateway, *, http: bool = False, sign_in: BrowserSignI
         if key is None:
             return f"{found.link}, then call sign_in again."
         principal = await authenticated(context, key, gateway.authorize)
-        if isinstance(found, str):
-            await announcer(context)()
+        await authenticated(context, key, gateway.tools)
+        await announcer(context)()
         return f"Signed in to LiteLLM as {principal}. The gateway's admin tools are now listed."
 
     async def list_tools(context, params):

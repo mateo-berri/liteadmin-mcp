@@ -251,7 +251,7 @@ async def test_without_a_browser_only_sign_in_is_listed_and_shows_the_link_until
     assert authorizations(gateway) == ["Bearer signed-in-admin-1"]
 
 
-async def test_sign_in_tool_waits_for_approval_in_the_opened_browser_and_links_a_slow_one(tmp_path):
+async def test_sign_in_tool_waits_for_approval_and_loads_the_admin_tools_before_answering_or_links_a_slow_one(tmp_path):
     gateway, store = SignInGateway(), CredentialStore(tmp_path / "sign-ins")
     opened = []
     browser = Browser(gateway)
@@ -265,6 +265,7 @@ async def test_sign_in_tool_waits_for_approval_in_the_opened_browser_and_links_a
         await asyncio.sleep(.05)
         await browser.visit(opened[0])
         assert "Signed in to LiteLLM as signed-in-admin-1" in (await waiting).content[0].text
+        assert "/openapi.json" in [request.url.path for request in gateway.requests]
     assert len(opened) == 1
 
 
